@@ -1,7 +1,13 @@
 name: release
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (skip git push)'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   release:
@@ -34,6 +40,9 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
+    - name: Install crane
+      uses: imjasonh/setup-crane@v0.4
+
     - name: Set release version
       id: version
       run: |
@@ -47,7 +56,9 @@ jobs:
           git tag -m "" "$VERSION"
           # Verify tag was created and points to the release commit
           git show tags/"$VERSION"
-          git push origin "tags/$VERSION"
+          if [ "${{ inputs.dry_run }}" != "true" ]; then
+            git push origin "tags/$VERSION"
+          fi
           DO_RELEASE=true
         fi
         VERSION=$(cat version)
@@ -103,13 +114,20 @@ jobs:
         single_remote=("${single_arch[@]/#/ghcr.io/trinodb/}")
         ./bin/push.sh "${single_remote[@]/%/:$VERSION}"
 
-        # Build and push amd64 multi_arch images with platform suffix
+        # Build and push amd64 multi_arch images by digest
         docker system prune --volumes -f
         make "${multi_arch[@]/%/@$VERSION}"
+        mkdir -p /tmp/digests
         for image in "${multi_arch[@]}"; do
-          docker tag "${image}:$VERSION" "ghcr.io/trinodb/${image}:${VERSION}-linux-amd64"
-          docker push "ghcr.io/trinodb/${image}:${VERSION}-linux-amd64"
+          SAFE_NAME="${image//\//-}"
+          docker save "${image}:$VERSION" | crane push - "ghcr.io/trinodb/${image}" > "/tmp/digests/${SAFE_NAME}-linux-amd64"
         done
+
+    - name: Upload digests
+      uses: actions/upload-artifact@v4
+      with:
+        name: digests-amd64
+        path: /tmp/digests/*
 
   release-arm64:
     needs: release
@@ -135,6 +153,9 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
+    - name: Install crane
+      uses: imjasonh/setup-crane@v0.4
+
     - name: Build and push arm64 images
       run: |
         # hive4.0-hive excluded - amd64 only
@@ -154,10 +175,17 @@ jobs:
         make meta
         make prepare-release
         make "${multi_arch[@]/%/@$VERSION}"
+        mkdir -p /tmp/digests
         for image in "${multi_arch[@]}"; do
-          docker tag "${image}:$VERSION" "ghcr.io/trinodb/${image}:${VERSION}-linux-arm64"
-          docker push "ghcr.io/trinodb/${image}:${VERSION}-linux-arm64"
+          SAFE_NAME="${image//\//-}"
+          docker save "${image}:$VERSION" | crane push - "ghcr.io/trinodb/${image}" > "/tmp/digests/${SAFE_NAME}-linux-arm64"
         done
+
+    - name: Upload digests
+      uses: actions/upload-artifact@v4
+      with:
+        name: digests-arm64
+        path: /tmp/digests/*
 
   create-manifests:
     needs: [release, release-arm64]
@@ -173,6 +201,16 @@ jobs:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install crane
+      uses: imjasonh/setup-crane@v0.4
+
+    - name: Download digests
+      uses: actions/download-artifact@v4
+      with:
+        path: /tmp/digests
+        pattern: digests-*
+        merge-multiple: true
 
     - name: Create and push manifests
       run: |
@@ -190,15 +228,17 @@ jobs:
           testing/spark3-hudi
         )
         for image in "${multi_arch[@]}"; do
-          docker manifest create "ghcr.io/trinodb/${image}:${VERSION}" \
-            "ghcr.io/trinodb/${image}:${VERSION}-linux-amd64" \
-            "ghcr.io/trinodb/${image}:${VERSION}-linux-arm64"
-          docker manifest push "ghcr.io/trinodb/${image}:${VERSION}"
+          SAFE_NAME="${image//\//-}"
+          AMD64_DIGEST=$(cat "/tmp/digests/${SAFE_NAME}-linux-amd64")
+          ARM64_DIGEST=$(cat "/tmp/digests/${SAFE_NAME}-linux-arm64")
+          crane index append --tag "ghcr.io/trinodb/${image}:${VERSION}" \
+            --manifest "${AMD64_DIGEST}" \
+            --manifest "${ARM64_DIGEST}"
         done
         # hive4.0-hive is amd64 only
-        docker manifest create "ghcr.io/trinodb/testing/hive4.0-hive:${VERSION}" \
-          "ghcr.io/trinodb/testing/hive4.0-hive:${VERSION}-linux-amd64"
-        docker manifest push "ghcr.io/trinodb/testing/hive4.0-hive:${VERSION}"
+        AMD64_DIGEST=$(cat "/tmp/digests/testing-hive4.0-hive-linux-amd64")
+        crane index append --tag "ghcr.io/trinodb/testing/hive4.0-hive:${VERSION}" \
+          --manifest "${AMD64_DIGEST}"
 
   finalize:
     needs: [release, create-manifests]
@@ -224,4 +264,6 @@ jobs:
         git diff
         git commit -a -m "Prepare for next development iteration"
         git show HEAD
-        git push origin HEAD:master
+        if [ "${{ inputs.dry_run }}" != "true" ]; then
+          git push origin HEAD:master
+        fi
