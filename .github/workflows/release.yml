@@ -1,42 +1,39 @@
 name: release
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Container registry prefix (e.g., ghcr.io/trinodb)'
+        required: false
+        default: 'ghcr.io/trinodb'
+      dry_run:
+        description: 'Dry run (skip git push)'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  prepare:
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
-      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      do_release: ${{ steps.version.outputs.DO_RELEASE }}
     steps:
     - uses: actions/checkout@v3
       with:
-        fetch-depth: 0 # checkout tags so version in Manifest is set properly
-
-    - name: Free up disk space
-      shell: bash
-      run: ./.github/bin/free-disk-space.sh
+        fetch-depth: 0
 
     - name: Configure Git user
       run: |
         git config user.email "releases@trinodb.io"
         git config user.name "Trino release automation"
 
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v2
-
-    - name: Log in to the Container registry
-      # locked to https://github.com/docker/login-action/releases/tag/v2.1.0
-      uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
     - name: Set release version
+      id: version
       run: |
-        # if there's a SNAPSHOT suffix, remove it and commit changes
         DO_RELEASE=false
         if grep -q '^[0-9]\+-SNAPSHOT$' version; then
           sed -i 's/^\([0-9]\+\)-SNAPSHOT$/\1/' version
@@ -44,20 +41,19 @@ jobs:
           git diff
           git commit -a -m "Release: $VERSION"
           git tag -m "" "$VERSION"
-          # Verify tag was created and points to the release commit
           git show tags/"$VERSION"
+          if [ "${{ inputs.dry_run }}" != "true" ]; then
+            git push origin "tags/$VERSION"
+          fi
           DO_RELEASE=true
         fi
         VERSION=$(cat version)
-        echo "VERSION=${VERSION}" >> $GITHUB_ENV
-        echo "DO_RELEASE=${DO_RELEASE}" >> $GITHUB_ENV
+        echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+        echo "DO_RELEASE=${DO_RELEASE}" >> $GITHUB_OUTPUT
 
-    - name: Make release
+    - name: Validate image lists
+      if: steps.version.outputs.DO_RELEASE == 'true'
       run: |
-        if [ "$DO_RELEASE" != "true" ]; then
-          echo "Skipping the release step because not starting from a snapshot version"
-          exit 0
-        fi
         skipped_images=(
           testing/almalinux9-oj17-openldap-base
         )
@@ -97,23 +93,204 @@ jobs:
         fi
         make prepare-release
 
-        make "${single_arch[@]/%/@$VERSION}"
-        # free up disk space
-        docker system prune --volumes
-        make "${multi_arch[@]/%/@$VERSION}" PLATFORMS="linux/amd64,linux/arm64"
+  build-single-arch:
+    needs: prepare
+    if: needs.prepare.outputs.do_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - testing/hdp3.1-hive
+          - testing/hdp3.1-hive-kerberized
+          - testing/hdp3.1-hive-kerberized-2
+          - testing/hdp3.1-hive-kerberized-kms
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
 
-        single_remote=("${single_arch[@]/#/ghcr.io/trinodb/}")
-        ./bin/push.sh "${single_remote[@]/%/:$VERSION}"
-        export PLATFORMS="linux/amd64,linux/arm64"
-        multi_remote=("${multi_arch[@]/#/ghcr.io/trinodb/}")
-        ./bin/push.sh "${multi_remote[@]/%/:$VERSION}"
+    - name: Free up disk space
+      run: ./.github/bin/free-disk-space.sh
+
+    - name: Log in to the Container registry
+      uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push ${{ matrix.image }}
+      env:
+        VERSION: ${{ needs.prepare.outputs.version }}
+      run: |
+        make "${{ matrix.image }}@$VERSION"
+        docker tag "${{ matrix.image }}:$VERSION" "${{ inputs.registry || 'ghcr.io/trinodb' }}/${{ matrix.image }}:$VERSION"
+        docker push "${{ inputs.registry || 'ghcr.io/trinodb' }}/${{ matrix.image }}:$VERSION"
+
+  build-multi-arch:
+    needs: prepare
+    if: needs.prepare.outputs.do_release == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - build/sphinx
+          - testing/almalinux9-oj11
+          - testing/almalinux9-oj17
+          - testing/almalinux9-oj17-openldap
+          - testing/almalinux9-oj17-openldap-referrals
+          - testing/almalinux9-oj17-openldap-active-directory
+          - testing/hive3.1-hive
+          - testing/kerberos
+          - testing/spark4-delta
+          - testing/spark4-iceberg
+          - testing/spark3-hudi
+          - testing/hive4.0-hive
+        platform:
+          - linux/amd64
+          - linux/arm64
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+        exclude:
+          - image: testing/hive4.0-hive
+            platform: linux/arm64
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Free up disk space
+      run: ./.github/bin/free-disk-space.sh
+
+    - name: Log in to the Container registry
+      uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push ${{ matrix.image }} (${{ matrix.platform }})
+      env:
+        VERSION: ${{ needs.prepare.outputs.version }}
+        PLATFORM: ${{ matrix.platform }}
+      run: |
+        ARCH_SUFFIX="${PLATFORM//\//-}"
+        REMOTE="${{ inputs.registry || 'ghcr.io/trinodb' }}/${{ matrix.image }}"
+        IMAGE_DIR=$(dirname "${{ matrix.image }}")/$(basename "${{ matrix.image }}")
+
+        cd "$IMAGE_DIR"
+        docker buildx build \
+          --platform "$PLATFORM" \
+          --label "io.trino.version=$VERSION" \
+          --output "type=image,name=${REMOTE},push=true" \
+          --metadata-file /tmp/metadata.json \
+          .
+
+        DIGEST=$(jq -r '.["containerimage.digest"]' /tmp/metadata.json)
+        mkdir -p /tmp/digests
+        SAFE_IMAGE_NAME=$(echo "${{ matrix.image }}" | tr '/' '-')
+        echo "$DIGEST" > "/tmp/digests/${SAFE_IMAGE_NAME}-${ARCH_SUFFIX}"
+
+    - name: Upload digest
+      uses: actions/upload-artifact@v4
+      with:
+        name: digest-${{ strategy.job-index }}
+        path: /tmp/digests/*
+        retention-days: 1
+
+  create-manifests:
+    needs: [prepare, build-multi-arch]
+    if: needs.prepare.outputs.do_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+    - name: Download all digests
+      uses: actions/download-artifact@v4
+      with:
+        path: /tmp/digests
+        pattern: digest-*
+        merge-multiple: true
+
+    - name: Log in to the Container registry
+      uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create and push manifests
+      env:
+        VERSION: ${{ needs.prepare.outputs.version }}
+        REGISTRY: ${{ inputs.registry || 'ghcr.io/trinodb' }}
+      run: |
+        multi_arch=(
+          build/sphinx
+          testing/almalinux9-oj11
+          testing/almalinux9-oj17
+          testing/almalinux9-oj17-openldap
+          testing/almalinux9-oj17-openldap-referrals
+          testing/almalinux9-oj17-openldap-active-directory
+          testing/hive3.1-hive
+          testing/kerberos
+          testing/spark4-delta
+          testing/spark4-iceberg
+          testing/spark3-hudi
+        )
+
+        for image in "${multi_arch[@]}"; do
+          SAFE_NAME=$(echo "$image" | tr '/' '-')
+          REMOTE="${REGISTRY}/${image}"
+
+          AMD64_DIGEST=$(cat "/tmp/digests/${SAFE_NAME}-linux-amd64")
+          ARM64_DIGEST=$(cat "/tmp/digests/${SAFE_NAME}-linux-arm64")
+
+          docker manifest create "${REMOTE}:${VERSION}" \
+            "${REMOTE}@${AMD64_DIGEST}" \
+            "${REMOTE}@${ARM64_DIGEST}"
+          docker manifest push "${REMOTE}:${VERSION}"
+        done
+
+        # hive4.0-hive is amd64 only
+        AMD64_DIGEST=$(cat "/tmp/digests/testing-hive4.0-hive-linux-amd64")
+        docker manifest create "${REGISTRY}/testing/hive4.0-hive:${VERSION}" \
+          "${REGISTRY}/testing/hive4.0-hive@${AMD64_DIGEST}"
+        docker manifest push "${REGISTRY}/testing/hive4.0-hive:${VERSION}"
+
+  finalize:
+    needs: [prepare, build-single-arch, create-manifests]
+    if: needs.prepare.outputs.do_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        ref: ${{ needs.prepare.outputs.version }}
+
+    - name: Configure Git user
+      run: |
+        git config user.email "releases@trinodb.io"
+        git config user.name "Trino release automation"
 
     - name: Set next development version
+      env:
+        VERSION: ${{ needs.prepare.outputs.version }}
       run: |
-        ((VERSION++))
-        echo "$VERSION-SNAPSHOT" > version
-        git diff
-        git commit -a -m "Prepare for next development iteration"
-        # Show the contents of the commit
-        git show HEAD
-        git push --tags origin master
+        NEXT_VERSION=$((VERSION + 1))
+        echo "$NEXT_VERSION-SNAPSHOT" > version
+        git add version
+        git commit -m "Prepare for next development iteration"
+        if [ "${{ inputs.dry_run }}" != "true" ]; then
+          git push origin HEAD:master
+        fi
